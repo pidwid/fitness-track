@@ -34,6 +34,9 @@ const DataManagement = () => {
     setIsLoading(true);
     try {
       const dailyEntries = await fetchAllDailyEntries();
+      if (!!dailyEntries) {
+        console.log("No entries found");
+      }
 
       dailyEntries.sort(
         (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime(),

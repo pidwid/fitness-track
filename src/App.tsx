@@ -25,13 +25,8 @@ function App() {
                   </Link>
                 </li>
                 <li>
-                  <Link to="/raw-data" className="hover:underline">
-                    Raw Data
-                  </Link>
-                </li>
-                <li>
-                  <Link to="/import" className="hover:underline">
-                    Import/Export
+                  <Link to="/data-management" className="hover:underline">
+                    Data Management
                   </Link>
                 </li>
               </ul>
@@ -43,8 +38,7 @@ function App() {
           <Routes>
             <Route path="/" element={<DataEntryForm />} />
             <Route path="/dashboard" element={<Dashboard />} />
-            <Route path="/raw-data" element={<DataManagement />} />
-            <Route path="/import" element={<DataImportExport />} />
+            <Route path="/data-management" element={<DataManagement />} />
           </Routes>
         </main>
 

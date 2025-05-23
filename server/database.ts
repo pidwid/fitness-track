@@ -1,204 +1,306 @@
-import Database from 'better-sqlite3';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import {
+  createClient,
+  LibsqlError,
+  type Client,
+  type ResultSet,
+  type Row,
+  type Transaction,
+} from "@libsql/client";
+import { env } from "../config.js";
 
-// ES modules fix for __dirname
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// Database file path - stored in the project root
-const dbPath = path.join(__dirname, '../fitness-data.db');
-
-// Create a directory if it doesn't exist
-const ensureDirectoryExists = (dirPath: string) => {
-  if (!fs.existsSync(dirPath)) {
-    fs.mkdirSync(dirPath, { recursive: true });
-  }
+// Turso configuration
+const tursoConfig = {
+  url: env.TURSO_DATABASE_URL,
+  authToken: env.TURSO_AUTH_TOKEN,
 };
 
-// Ensure the parent directory exists
-ensureDirectoryExists(path.dirname(dbPath));
+let dbClient: Client | null = null;
 
 // Create or connect to the database
-export const getDatabase = () => {
-  const db = new Database(dbPath);
-  db.pragma('journal_mode = WAL'); // Better performance and reliability
-  return db;
+export const getDatabase = (): Client => {
+  if (!tursoConfig.url) {
+    throw new Error("TURSO_DATABASE_URL is not set.");
+  }
+  if (!tursoConfig.authToken && !tursoConfig.url.startsWith("file:")) {
+    // Allow missing authToken for local file URLs, but error for remote non-file URLs
+    if (
+      !tursoConfig.url.includes("localhost") &&
+      !tursoConfig.url.includes("127.0.0.1")
+    ) {
+      console.warn(
+        "TURSO_AUTH_TOKEN is not set. This is required for remote Turso databases.",
+      );
+      // throw new Error("TURSO_AUTH_TOKEN is not set."); // Or just warn and let it try
+    }
+  }
+
+  if (!dbClient) {
+    dbClient = createClient({
+      url: tursoConfig.url,
+      authToken: tursoConfig.authToken,
+    });
+  }
+  return dbClient;
 };
 
 // Initialize the database with tables
-export const initializeDatabase = () => {
+export const initializeDatabase = async (): Promise<void> => {
   const db = getDatabase();
 
-  // Create tables if they don't exist
-  db.exec(`
-    -- Daily entries table
-    CREATE TABLE IF NOT EXISTS daily_entries (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      date TEXT NOT NULL UNIQUE,
-      weight REAL,
-      calories REAL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
+  try {
+    // Create tables if they don't exist
+    // Note: Turso/libSQL might handle `IF NOT EXISTS` slightly differently or might require separate statements.
+    // Using batch for DDL statements.
+    await db.batch(
+      [
+        `CREATE TABLE IF NOT EXISTS daily_entries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT NOT NULL UNIQUE,
+        weight REAL,
+        calories REAL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );`,
+        `CREATE TABLE IF NOT EXISTS exercises (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT NOT NULL,
+        type TEXT NOT NULL,
+        details TEXT,
+        entry_id INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (entry_id) REFERENCES daily_entries(id) ON DELETE CASCADE
+      );`,
+        `CREATE INDEX IF NOT EXISTS idx_daily_entries_date ON daily_entries(date);`,
+        `CREATE INDEX IF NOT EXISTS idx_exercises_date ON exercises(date);`,
+        `CREATE INDEX IF NOT EXISTS idx_exercises_entry_id ON exercises(entry_id);`,
+      ],
+      "write",
+    ); // 'write' mode for DDL statements
 
-    -- Exercises table
-    CREATE TABLE IF NOT EXISTS exercises (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      date TEXT NOT NULL,
-      type TEXT NOT NULL,
-      details TEXT,
-      entry_id INTEGER NOT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (entry_id) REFERENCES daily_entries(id) ON DELETE CASCADE
-    );
-
-    -- Create date index for faster queries
-    CREATE INDEX IF NOT EXISTS idx_daily_entries_date ON daily_entries(date);
-    CREATE INDEX IF NOT EXISTS idx_exercises_date ON exercises(date);
-    CREATE INDEX IF NOT EXISTS idx_exercises_entry_id ON exercises(entry_id);
-  `);
-
-  console.log('Database initialized successfully');
-  return db;
+    console.log("Database schema initialization attempted successfully");
+  } catch (error) {
+    if (error instanceof LibsqlError && error.code === "SQLITE_CONSTRAINT") {
+      // This can happen if tables/indexes already exist and IF NOT EXISTS is not fully supported
+      // or if there's another constraint violation during complex initializations.
+      console.warn(
+        "Warning during database initialization (possibly tables/indexes already exist):",
+        error.message,
+      );
+    } else if (
+      error instanceof LibsqlError &&
+      error.message.includes("already exists")
+    ) {
+      console.warn(
+        "Warning during database initialization (table/index already exists):",
+        error.message,
+      );
+    } else {
+      console.error("Error initializing database:", error);
+      throw error; // Re-throw if it's not a "table already exists" type error
+    }
+  }
 };
+
+// Define interfaces for row data for better type safety
+export interface DailyEntryRow extends Row {
+  id: number;
+  date: string;
+  weight?: number | null;
+  calories?: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ExerciseRow extends Row {
+  id: number;
+  date: string;
+  type: string;
+  details?: string | null;
+  entry_id: number;
+  created_at: string;
+  updated_at: string;
+}
 
 // Export models for use in route handlers
 export const models = {
   // Daily entries
-  getDailyEntries: () => {
+  getDailyEntries: async (): Promise<DailyEntryRow[]> => {
     const db = getDatabase();
-    return db.prepare('SELECT * FROM daily_entries ORDER BY date DESC').all();
-  },
-
-  getDailyEntryByDate: (date: string) => {
-    const db = getDatabase();
-    return db.prepare('SELECT * FROM daily_entries WHERE date = ?').get(date);
-  },
-
-  getDailyEntryById: (id: number) => {
-    const db = getDatabase();
-    return db.prepare('SELECT * FROM daily_entries WHERE id = ?').get(id);
-  },
-
-  addDailyEntry: (date: string, weight?: number, calories?: number) => {
-    const db = getDatabase();
-    const stmt = db.prepare(
-      'INSERT INTO daily_entries (date, weight, calories) VALUES (?, ?, ?)'
+    const rs = await db.execute(
+      "SELECT * FROM daily_entries ORDER BY date DESC",
     );
-    return stmt.run(date, weight || null, calories || null);
+    return rs.rows as DailyEntryRow[];
   },
 
-  updateDailyEntry: (id: number, weight?: number, calories?: number) => {
+  getDailyEntryByDate: async (
+    date: string,
+  ): Promise<DailyEntryRow | undefined> => {
     const db = getDatabase();
-    const stmt = db.prepare(
-      'UPDATE daily_entries SET weight = ?, calories = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
-    );
-    return stmt.run(weight || null, calories || null, id);
+    const rs = await db.execute({
+      sql: "SELECT * FROM daily_entries WHERE date = ?",
+      args: [date],
+    });
+    return rs.rows[0] as DailyEntryRow | undefined;
   },
 
-  deleteDailyEntry: (id: number) => {
+  getDailyEntryById: async (id: number): Promise<DailyEntryRow | undefined> => {
     const db = getDatabase();
-    return db.prepare('DELETE FROM daily_entries WHERE id = ?').run(id);
+    const rs = await db.execute({
+      sql: "SELECT * FROM daily_entries WHERE id = ?",
+      args: [id],
+    });
+    return rs.rows[0] as DailyEntryRow | undefined;
+  },
+
+  addDailyEntry: async (
+    date: string,
+    weight?: number,
+    calories?: number,
+  ): Promise<ResultSet> => {
+    const db = getDatabase();
+    return db.execute({
+      sql: "INSERT INTO daily_entries (date, weight, calories) VALUES (?, ?, ?)",
+      args: [date, weight ?? null, calories ?? null],
+    });
+  },
+
+  updateDailyEntry: async (
+    id: number,
+    weight?: number,
+    calories?: number,
+  ): Promise<ResultSet> => {
+    const db = getDatabase();
+    return db.execute({
+      sql: "UPDATE daily_entries SET weight = ?, calories = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+      args: [weight ?? null, calories ?? null, id],
+    });
+  },
+
+  deleteDailyEntry: async (id: number): Promise<ResultSet> => {
+    const db = getDatabase();
+    return db.execute({
+      sql: "DELETE FROM daily_entries WHERE id = ?",
+      args: [id],
+    });
   },
 
   // Exercises
-  getExercisesByEntryId: (entryId: number) => {
+  getExercisesByEntryId: async (entryId: number): Promise<ExerciseRow[]> => {
     const db = getDatabase();
-    return db.prepare('SELECT * FROM exercises WHERE entry_id = ?').all(entryId);
+    const rs = await db.execute({
+      sql: "SELECT * FROM exercises WHERE entry_id = ?",
+      args: [entryId],
+    });
+    return rs.rows as ExerciseRow[];
   },
 
-  getExercisesByDate: (date: string) => {
+  getExercisesByDate: async (date: string): Promise<ExerciseRow[]> => {
     const db = getDatabase();
-    return db.prepare('SELECT * FROM exercises WHERE date = ?').all(date);
+    const rs = await db.execute({
+      sql: "SELECT * FROM exercises WHERE date = ?",
+      args: [date],
+    });
+    return rs.rows as ExerciseRow[];
   },
 
-  addExercise: (date: string, type: string, details: string, entryId: number) => {
+  addExercise: async (
+    date: string,
+    type: string,
+    details: string,
+    entryId: number,
+  ): Promise<ResultSet> => {
     const db = getDatabase();
-    const stmt = db.prepare(
-      'INSERT INTO exercises (date, type, details, entry_id) VALUES (?, ?, ?, ?)'
-    );
-    return stmt.run(date, type, details, entryId);
+    return db.execute({
+      sql: "INSERT INTO exercises (date, type, details, entry_id) VALUES (?, ?, ?, ?)",
+      args: [date, type, details, entryId],
+    });
   },
 
-  updateExercise: (id: number, type: string, details: string) => {
+  updateExercise: async (
+    id: number,
+    type: string,
+    details: string,
+  ): Promise<ResultSet> => {
     const db = getDatabase();
-    const stmt = db.prepare(
-      'UPDATE exercises SET type = ?, details = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
-    );
-    return stmt.run(type, details, id);
+    return db.execute({
+      sql: "UPDATE exercises SET type = ?, details = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+      args: [type, details, id],
+    });
   },
 
-  deleteExercise: (id: number) => {
+  deleteExercise: async (id: number): Promise<ResultSet> => {
     const db = getDatabase();
-    return db.prepare('DELETE FROM exercises WHERE id = ?').run(id);
+    return db.execute({
+      sql: "DELETE FROM exercises WHERE id = ?",
+      args: [id],
+    });
   },
 
   // Data export
-  exportData: () => {
+  exportData: async (): Promise<any[]> => {
     const db = getDatabase();
-    const dailyEntries = db.prepare('SELECT * FROM daily_entries ORDER BY date').all();
-    
-    // Get exercises for each entry
-    const result = dailyEntries.map(entry => {
-      const exercises = db.prepare('SELECT * FROM exercises WHERE entry_id = ?').all(entry.id);
-      return {
+    const entriesResult = await db.execute(
+      "SELECT * FROM daily_entries ORDER BY date",
+    );
+    const dailyEntries = entriesResult.rows as DailyEntryRow[];
+
+    const result = [];
+    for (const entry of dailyEntries) {
+      const exercisesResult = await db.execute({
+        sql: "SELECT * FROM exercises WHERE entry_id = ?",
+        args: [entry.id],
+      });
+      result.push({
         ...entry,
-        exercises
-      };
-    });
-    
+        exercises: exercisesResult.rows as ExerciseRow[],
+      });
+    }
     return result;
   },
 
   // Data import (for backup restoration)
-  importData: (data: any[]) => {
+  importData: async (
+    data: any[],
+  ): Promise<{ success: boolean; count: number }> => {
     const db = getDatabase();
-    
-    // Begin transaction
-    const transaction = db.transaction((data) => {
-      // Clear existing data
-      db.prepare('DELETE FROM exercises').run();
-      db.prepare('DELETE FROM daily_entries').run();
-      
-      // Insert new data
-      const insertEntry = db.prepare(
-        'INSERT INTO daily_entries (id, date, weight, calories, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
-      );
-      
-      const insertExercise = db.prepare(
-        'INSERT INTO exercises (id, date, type, details, entry_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-      );
-      
+
+    await db.transaction(async (tx: Transaction) => {
+      await tx.execute("DELETE FROM exercises");
+      await tx.execute("DELETE FROM daily_entries"); // Resetting sequence might be needed for some SQL dbs, but AUTOINCREMENT handles it.
+
       for (const entry of data) {
-        insertEntry.run(
-          entry.id, 
-          entry.date, 
-          entry.weight, 
-          entry.calories,
-          entry.created_at || new Date().toISOString(),
-          entry.updated_at || new Date().toISOString()
-        );
-        
+        await tx.execute({
+          sql: "INSERT INTO daily_entries (id, date, weight, calories, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+          args: [
+            entry.id,
+            entry.date,
+            entry.weight ?? null,
+            entry.calories ?? null,
+            entry.created_at || new Date().toISOString(),
+            entry.updated_at || new Date().toISOString(),
+          ],
+        });
+
         if (entry.exercises && Array.isArray(entry.exercises)) {
           for (const exercise of entry.exercises) {
-            insertExercise.run(
-              exercise.id,
-              exercise.date,
-              exercise.type,
-              exercise.details,
-              exercise.entry_id,
-              exercise.created_at || new Date().toISOString(),
-              exercise.updated_at || new Date().toISOString()
-            );
+            await tx.execute({
+              sql: "INSERT INTO exercises (id, date, type, details, entry_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+              args: [
+                exercise.id, // Assuming IDs are preserved
+                exercise.date,
+                exercise.type,
+                exercise.details ?? null,
+                exercise.entry_id, // This should match the entry.id above
+                exercise.created_at || new Date().toISOString(),
+                exercise.updated_at || new Date().toISOString(),
+              ],
+            });
           }
         }
       }
     });
-    
-    transaction(data);
+
     return { success: true, count: data.length };
-  }
+  },
 };
