@@ -7,7 +7,6 @@ const router = express.Router();
 router.get("/", async (req, res) => {
   try {
     const entries = await models.getDailyEntries();
-    console.log(entries);
     res.json(entries);
   } catch (error) {
     console.error("Error getting daily entries:", error);

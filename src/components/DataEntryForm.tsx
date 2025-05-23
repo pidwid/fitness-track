@@ -118,11 +118,12 @@ const DataEntryForm = () => {
       
       // Handle exercises
       for (const exercise of exercises) {
-        if (exercise.type.trim() || exercise.details.trim()) {
+        // Only save exercises with a non-empty type (required field)
+        if (exercise.type.trim()) {
           const exerciseEntry: ExerciseEntry = {
             date,
-            type: exercise.type,
-            details: exercise.details,
+            type: exercise.type.trim(),
+            details: exercise.details.trim(),
             entry_id: entryId
           };
           
